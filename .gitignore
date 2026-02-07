@@ -1,0 +1,16 @@
+# --- Security: Block Financial Data ---
+*.csv
+*.xlsx
+*.xls
+*.gsheet
+*.json
+
+# --- Block System Junk ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# --- Exception: Allow the Template/Manifest ---
+!appsscript.json
+!template.gs
