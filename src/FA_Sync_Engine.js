@@ -2,73 +2,98 @@
 const SCRIPT_PROPS = PropertiesService.getScriptProperties();
 const BASE_URL = 'https://api.freeagent.com/v2';
 
+/**
+ * TRIGGER: Runs automatically when the Spreadsheet is opened.
+ * Adds a menu to the toolbar for easy access.
+ */
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Financial Intelligence')
+      .addItem('🔄 Run Sync Now', 'runSync')
+      .addSeparator()
+      .addItem('💰 Update Cash Balance Only', 'updateCashBalance')
+      .addToUi();
+}
+
 // 2. Main Execution Function
-function runDailySync() {
+function runSync() {
+  console.log("🚀 STARTING SYNC: Initializing Financial Intelligence Engine...");
+  
   const sheet = SpreadsheetApp.getActiveSpreadsheet();
   const rawDataTab = sheet.getSheetByName('Raw_Data');
   const mappingTab = sheet.getSheetByName('Mapping');
   
-  // 1. Fetch Transactions (Unrestricted)
+  // A. Fetch Transactions
   const transactions = getFreeAgentData(); 
   
-  if (transactions.length === 0) {
-    console.log("Sync Complete: No new transactions found.");
-    return;
-  }
+  if (transactions.length > 0) {
+    console.log(`⚡ Processing ${transactions.length} new transactions against Mapping Rules...`);
+    
+    // Get Rules
+    const rules = getMappingRules(mappingTab);
+    const existingIds = getExistingIds(rawDataTab); 
+    
+    const newRows = [];
+    let autoClassifiedCount = 0;
+    
+    transactions.forEach(tx => {
+      if (!existingIds.has(tx.id)) {
+        
+        let categoryName = "Uncategorised";
+        let department = "General Administrative"; 
+        
+        const desc = (tx.description || "").toLowerCase();
 
-  // 2. Get Rules
-  const rules = getMappingRules(mappingTab);
-  const existingIds = getExistingIds(rawDataTab); 
-  
-  const newRows = [];
-  
-  transactions.forEach(tx => {
-    if (!existingIds.has(tx.id)) {
-      
-      let categoryName = "Uncategorised";
-      let department = "General Administrative"; 
-      
-      const desc = (tx.description || "").toLowerCase();
-
-      // Priority 1: Keyword Match (Auto-Classify)
-      let foundMatch = false;
-      for (const rule of rules.keywords) {
-        if (desc.includes(rule.keyword)) {
-          categoryName = rule.category; 
-          department = rule.department; 
-          foundMatch = true;
-          break;
+        // Priority 1: Keyword Match (Auto-Classify)
+        let foundMatch = false;
+        for (const rule of rules.keywords) {
+          if (desc.includes(rule.keyword)) {
+            categoryName = rule.category; 
+            department = rule.department; 
+            foundMatch = true;
+            autoClassifiedCount++;
+            break;
+          }
         }
-      }
 
-      // Priority 2: FreeAgent Category (if API provided one)
-      if (!foundMatch && tx.category_name && rules.exact[tx.category_name]) {
-        categoryName = tx.category_name;
-        department = rules.exact[tx.category_name];
+        // Priority 2: FreeAgent Category (if API provided one)
+        if (!foundMatch && tx.category_name && rules.exact[tx.category_name]) {
+          categoryName = tx.category_name;
+          department = rules.exact[tx.category_name];
+        }
+        
+        newRows.push([
+          tx.dated_on,
+          tx.description,
+          tx.amount,
+          categoryName,
+          department,
+          tx.id 
+        ]); 
       }
-      
-      newRows.push([
-        tx.dated_on,
-        tx.description,
-        tx.amount,
-        categoryName,
-        department,
-        tx.id 
-      ]); 
+    });
+
+    // Append data
+    if (newRows.length > 0) {
+      const startRow = rawDataTab.getLastRow() + 1;
+      rawDataTab.getRange(startRow, 1, newRows.length, newRows[0].length).setValues(newRows);
+      console.log(`✅ SUCCESS: Added ${newRows.length} new rows to Raw_Data.`);
+      console.log(`🤖 Auto-Classified: ${autoClassifiedCount} transactions.`);
+    } else {
+      console.log("ℹ️ Sync Complete: Transactions downloaded, but they were all duplicates.");
     }
-  });
-
-  // 3. Append data
-  if (newRows.length > 0) {
-    const startRow = rawDataTab.getLastRow() + 1;
-    rawDataTab.getRange(startRow, 1, newRows.length, newRows[0].length).setValues(newRows);
-    console.log(`SUCCESS: Added ${newRows.length} transactions.`);
   } else {
-    console.log("Sync Complete: All downloaded transactions were duplicates.");
+    console.log("ℹ️ Sync Complete: No new transactions found from FreeAgent.");
   }
+
+  // B. UPDATE CASH BALANCE
+  updateCashBalance();
+  
+  console.log("🏁 MISSION COMPLETE: Dashboard is up to date.");
 }
 
-// Helper: Parse Mapping Rules
+// ---------------- HELPERS ---------------- //
+
 function getMappingRules(sheet) {
   const data = sheet.getDataRange().getValues();
   const exact = {};
@@ -100,59 +125,98 @@ function getExistingIds(sheet) {
   return ids;
 }
 
-// 3. API Connection (Pagination + Hidden Accounts)
+// 3. API Connection (With Detailed Logging)
 function getFreeAgentData() {
   const service = getService_();
-  if (!service.hasAccess()) return [];
+  if (!service.hasAccess()) {
+    console.error("❌ AUTH ERROR: Please run the Auth script again.");
+    return [];
+  }
 
   const today = new Date();
   const lookbackDate = new Date(today);
-  lookbackDate.setDate(today.getDate() - 730); // 2 Years Lookback (for closed accounts)
+  lookbackDate.setDate(today.getDate() - 730); // 2 Years Lookback
   const dateString = Utilities.formatDate(lookbackDate, Session.getScriptTimeZone(), "yyyy-MM-dd");
   
   const allTransactions = [];
   const authHeader = { Authorization: 'Bearer ' + service.getAccessToken() };
 
   try {
-    // A. Get ALL Accounts (Added view=all to see Closed/Inactive)
+    console.log("🔍 API: Searching for bank accounts...");
     const accResponse = UrlFetchApp.fetch(`${BASE_URL}/bank_accounts?view=all`, { headers: authHeader, muteHttpExceptions: true });
     const accounts = JSON.parse(accResponse.getContentText()).bank_accounts || [];
 
-    console.log(`Found ${accounts.length} bank accounts (including closed).`);
+    console.log(`🏦 Found ${accounts.length} accounts (Active & Closed).`);
 
-    // B. Loop Accounts
     accounts.forEach(account => {
       let page = 1;
       let keepFetching = true;
+      let accountTxCount = 0;
       
-      console.log(`Fetching: ${account.name}...`);
-
-      // C. Pagination Loop (Keep asking until data runs dry)
+      console.log(`   👉 Checking: ${account.name}...`);
+      
       while (keepFetching) {
         const txUrl = `${BASE_URL}/bank_transactions?bank_account=${encodeURIComponent(account.url)}&from_date=${dateString}&page=${page}&per_page=100`;
-        
         const txResponse = UrlFetchApp.fetch(txUrl, { headers: authHeader, muteHttpExceptions: true });
         const rawTxs = JSON.parse(txResponse.getContentText()).bank_transactions || [];
         
         if (rawTxs.length === 0) {
-          keepFetching = false; // Stop if page is empty
+          keepFetching = false; 
         } else {
           rawTxs.forEach(tx => {
             tx.id = tx.url.split('/').pop();
             allTransactions.push(tx);
           });
           
+          accountTxCount += rawTxs.length;
+
           if (rawTxs.length < 100) {
-             keepFetching = false; // Stop if page wasn't full (last page)
+             keepFetching = false;
           } else {
-             page++; // Next page
+             console.log(`      - Page ${page} complete. fetching next...`);
+             page++;
           }
         }
       }
+      console.log(`      ✓ Retrieved ${accountTxCount} transactions.`);
     });
 
   } catch (e) {
-    console.error(e);
+    console.error("❌ CRITICAL API ERROR: " + e.toString());
   }
   return allTransactions;
+}
+
+// 4. Live Cash Balance (Target: Dashboard B5)
+function updateCashBalance() {
+  console.log("💰 BALANCE CHECK: Fetching live cash position...");
+  
+  const service = getService_();
+  if (!service.hasAccess()) return;
+  
+  const sheet = SpreadsheetApp.getActiveSpreadsheet();
+  const dashboardTab = sheet.getSheetByName('Dashboard');
+  
+  const authHeader = { Authorization: 'Bearer ' + service.getAccessToken() };
+  const url = `${BASE_URL}/bank_accounts?view=active`; 
+  
+  try {
+    const response = UrlFetchApp.fetch(url, { headers: authHeader, muteHttpExceptions: true });
+    const accounts = JSON.parse(response.getContentText()).bank_accounts || [];
+    
+    let totalCash = 0;
+    
+    accounts.forEach(acc => {
+      if (acc.current_balance) {
+        totalCash += parseFloat(acc.current_balance);
+      }
+    });
+    
+    // Write to Cell B5
+    dashboardTab.getRange("B5").setValue(totalCash);
+    console.log(`💷 LIVE CASH UPDATED: £${totalCash.toLocaleString()}`);
+    
+  } catch (e) {
+    console.error("❌ BALANCE ERROR: " + e.toString());
+  }
 }
